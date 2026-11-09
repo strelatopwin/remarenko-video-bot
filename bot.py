@@ -8,6 +8,8 @@ from pathlib import Path
 
 import aiohttp
 
+from payments import PLANS, Payments
+
 SIZE = 640
 MAX_SECONDS = 60
 VIDEO_FORMATS = "mov,matroska,webm,avi,mpegts,mpeg,flv,ogg,asf"
@@ -75,6 +77,7 @@ async def convert(source, output):
 class Bot:
     def __init__(self, session):
         self.session = session
+        self.payments = Payments(session)
         token = os.environ["BOT_TOKEN"]
         self.base = f'{os.environ.get("BOT_API_URL", "https://api.telegram.org").rstrip("/")}/bot{token}'
         self.file_base = self.base.replace("/bot" + token, "/file/bot" + token)
@@ -118,20 +121,73 @@ class Bot:
                     stream.write(chunk)
         return destination
 
+    async def notify(self, chat_id, text):
+        await self.call("sendMessage", chat_id=chat_id, text=text)
+
+    async def show_access(self, chat_id, text=""):
+        buttons = []
+        if self.payments.enabled and chat_id != self.payments.owner:
+            buttons = [
+                [{"text": f"{title} · {amount} грн", "callback_data": f"buy:{plan}"}]
+                for plan, (title, _, amount) in PLANS.items()
+            ]
+            buttons.append([{"text": "Мій доступ", "callback_data": "access"}])
+        await self.call(
+            "sendMessage", chat_id=chat_id, text=text + self.payments.status(chat_id),
+            reply_markup={"inline_keyboard": buttons},
+        )
+
+    async def handle_callback(self, callback):
+        await self.call("answerCallbackQuery", callback_query_id=callback["id"])
+        user_id = callback["from"]["id"]
+        chat = callback.get("message", {}).get("chat", {})
+        data = callback.get("data", "")
+        if chat.get("type") != "private" or chat.get("id") != user_id:
+            return
+        if (not self.payments.enabled or user_id == self.payments.owner
+                or self.allowed_users and user_id not in self.allowed_users):
+            return
+        if data == "access":
+            await self.notify(user_id, self.payments.status(user_id))
+            return
+        if not data.startswith("buy:") or data[4:] not in PLANS:
+            return
+        plan = data[4:]
+        try:
+            url = await self.payments.invoice(user_id, plan)
+        except (aiohttp.ClientError, TimeoutError, ValueError) as error:
+            logging.warning("WayForPay invoice failed (%s)", type(error).__name__)
+            await self.notify(user_id, "Не вдалося створити рахунок. Спробуй пізніше або напиши @P2P_Marshal.")
+            return
+        title, _, amount = PLANS[plan]
+        await self.call(
+            "sendMessage", chat_id=user_id,
+            text=f"{title} · {amount} грн. Доступ активується після підтвердження оплати.",
+            reply_markup={"inline_keyboard": [[{"text": "Оплатити через WayForPay", "url": url}]]},
+        )
+
     async def handle(self, message):
         chat = message["chat"]
         if chat["type"] != "private":
             return
         chat_id = chat["id"]
-        if self.allowed_users and chat_id not in self.allowed_users:
+        if chat_id != self.payments.owner and self.allowed_users and chat_id not in self.allowed_users:
             await self.call("sendMessage", chat_id=chat_id, text="Цей бот має обмежений доступ.")
             return
 
         media = message.get("video") or message.get("document")
         if not media:
-            await self.call("sendMessage", chat_id=chat_id, text=HELP)
+            command = (message.get("text") or "").partition(" ")[0].split("@")[0]
+            if command == "/paysupport":
+                await self.notify(chat_id, "Питання щодо оплати — @P2P_Marshal. Вкажи номер рахунку, якщо він є.")
+            else:
+                await self.show_access(chat_id, "" if command in {"/access", "/plans"} else HELP + "\n\n")
             return
 
+        if self.payments.blocked(chat_id):
+            await self.show_access(chat_id, "Пробні конвертації закінчилися. Обери тариф.\n\n")
+            return
+        trial = self.payments.use_trial(chat_id)
         try:
             if (media.get("file_size") or 0) > self.max_bytes:
                 raise VideoError(f"Файл завеликий. Ліміт цього бота — {self.max_bytes // 1024**2} МБ.")
@@ -154,6 +210,8 @@ class Bot:
                     }))
                     form.add_field("video_note", video, filename=output.name, content_type="video/mp4")
                     await self.call("sendVideoNote", form=form)
+                if trial:
+                    self.payments.record_trial(chat_id, message["message_id"])
         except VideoError as error:
             await self.call("sendMessage", chat_id=chat_id, text=str(error))
         except (TelegramError, aiohttp.ClientError, TimeoutError, OSError, KeyError, ValueError) as error:
@@ -170,12 +228,15 @@ class Bot:
                     await self.call("setMyCommands", commands=[
                         {"command": "start", "description": "Як зробити відеокружечок"},
                         {"command": "help", "description": "Підказка щодо відео"},
+                        {"command": "access", "description": "Мій доступ"},
+                        {"command": "plans", "description": "Тарифи"},
+                        {"command": "paysupport", "description": "Підтримка щодо оплати"},
                     ])
                     await self.call("setMyDescription", description=HELP)
                     logging.info("Бот готовий приймати відео до %s МБ", self.max_bytes // 1024**2)
                     configured = True
                 updates = await self.call("getUpdates", offset=offset, timeout=25,
-                                          allowed_updates=["message"])
+                                          allowed_updates=["message", "callback_query"])
             except TelegramError as error:
                 logging.warning("Telegram API returned %s", error.code)
                 await asyncio.sleep(max(error.retry_after, 5))
@@ -188,6 +249,8 @@ class Bot:
                 try:
                     if "message" in update:
                         await self.handle(update["message"])
+                    elif "callback_query" in update:
+                        await self.handle_callback(update["callback_query"])
                 except (TelegramError, aiohttp.ClientError, TimeoutError) as error:
                     logging.warning("Could not answer update (%s)", type(error).__name__)
                 offset = update["update_id"] + 1
@@ -198,7 +261,13 @@ async def main():
     if not os.environ.get("BOT_TOKEN"):
         raise SystemExit("Set BOT_TOKEN before starting the bot.")
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=90)) as session:
-        await Bot(session).run()
+        bot = Bot(session)
+        if bot.payments.enabled:
+            async with asyncio.TaskGroup() as group:
+                group.create_task(bot.payments.run(bot.notify))
+                group.create_task(bot.run())
+        else:
+            await bot.run()
 
 
 if __name__ == "__main__":

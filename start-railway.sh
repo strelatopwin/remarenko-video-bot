@@ -5,11 +5,15 @@ set -euo pipefail
 : "${TELEGRAM_API_ID:?Set TELEGRAM_API_ID in Railway Variables}"
 : "${TELEGRAM_API_HASH:?Set TELEGRAM_API_HASH in Railway Variables}"
 
-telegram-bot-api --local --http-ip-address=127.0.0.1 --http-port=8081 \
+if [[ "${RAILWAY_VOLUME_MOUNT_PATH:-}" == "/data" ]]; then
+  chown 101:101 /data
+fi
+
+su-exec 101:101 telegram-bot-api --local --http-ip-address=127.0.0.1 --http-port=8081 \
   --dir="$TELEGRAM_CACHE_DIR" --temp-dir=/tmp/telegram-bot-api \
   --api-id="$TELEGRAM_API_ID" --api-hash="$TELEGRAM_API_HASH" &
 api_pid=$!
-/opt/venv/bin/python -u /app/bot.py &
+su-exec 101:101 /opt/venv/bin/python -u /app/bot.py &
 bot_pid=$!
 
 cleanup() {

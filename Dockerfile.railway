@@ -1,12 +1,11 @@
 FROM aiogram/telegram-bot-api:latest
 
-RUN apk add --no-cache bash ca-certificates ffmpeg python3 py3-pip zlib \
+RUN apk add --no-cache bash ca-certificates ffmpeg python3 py3-pip zlib su-exec tzdata \
     && python3 -m venv /opt/venv
 WORKDIR /app
 COPY requirements.txt .
 RUN /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
-COPY bot.py start-railway.sh ./
+COPY bot.py payments.py start-railway.sh ./
 ENV BOT_API_URL=http://127.0.0.1:8081 \
     TELEGRAM_CACHE_DIR=/var/lib/telegram-bot-api
-USER 101:101
 ENTRYPOINT ["/bin/bash", "/app/start-railway.sh"]
