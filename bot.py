@@ -3,12 +3,13 @@ import json
 import logging
 import math
 import os
+import re
 import tempfile
 from pathlib import Path
 
 import aiohttp
 
-from payments import PLANS, Payments
+from payments import CLIENT_STAGES, PLANS, Payments
 
 SIZE = 640
 MAX_SECONDS = 60
@@ -142,6 +143,54 @@ class Bot:
             reply_markup={"inline_keyboard": buttons},
         )
 
+    async def show_client_report(self, chat_id, command, args):
+        if chat_id != self.payments.owner:
+            return
+        if not self.payments.enabled:
+            await self.notify(chat_id, "База клієнтів доступна після підключення платежів і сховища /data.")
+            return
+
+        if command == "/stats":
+            stages, plans = self.payments.client_report()
+            lines = [f"📊 Клієнтів у базі: {sum(stages.values())}", ""]
+            for key, title in CLIENT_STAGES.items():
+                lines.append(f"{title}: {stages.get(key, 0)}")
+            lines.extend(["", "Підтверджені покупки за тарифами"])
+            purchases = {row["plan"]: row for row in plans}
+            for key in dict.fromkeys([*PLANS, *purchases]):
+                row = purchases.get(key)
+                title = PLANS[key][0] if key in PLANS else key
+                lines.append(f"{title}: {row['purchases'] if row else 0}")
+            lines.extend([f"Сума підтверджених оплат: {sum(row['revenue'] for row in plans)} грн",
+                          "", "/clients — переглянути список за стадією"])
+            await self.notify(chat_id, "\n".join(lines))
+            return
+
+        parts = args.split()
+        stage, page_text = (parts + ["1"])[:2] if parts else ("", "1")
+        if stage not in CLIENT_STAGES or len(parts) > 2 or not re.fullmatch(r"[1-9][0-9]{0,5}", page_text):
+            lines = ["Вибери стадію клієнтів:"] + [
+                f"/clients {key} — {title}" for key, title in CLIENT_STAGES.items()
+            ]
+            await self.notify(chat_id, "\n".join(lines))
+            return
+        page = int(page_text)
+        rows = self.payments.client_report(stage, (page - 1) * 10)
+        lines = [f"{CLIENT_STAGES[stage]} · сторінка {page}", ""]
+        if not rows:
+            lines.append("На цій сторінці клієнтів немає.")
+        for row in rows[:10]:
+            name = " ".join((row["first_name"] or "").split())[:80]
+            username = f" @{row['username']}" if row["username"] else ""
+            plan = row["paid_plan"] or row["pending_plan"]
+            title = PLANS[plan][0] if plan in PLANS else plan
+            label = "Остання покупка" if row["paid_plan"] else "Рахунок"
+            detail = f" · {label}: {title}" if title else ""
+            lines.append(f"{row['user_id']} · {name or 'Ім’я відсутнє'}{username}{detail}")
+        if len(rows) > 10:
+            lines.extend(["", f"Далі → /clients {stage} {page + 1}"])
+        await self.notify(chat_id, "\n".join(lines))
+
     async def handle_callback(self, callback):
         await self.call("answerCallbackQuery", callback_query_id=callback["id"])
         user_id = callback["from"]["id"]
@@ -152,6 +201,7 @@ class Bot:
         if (not self.payments.enabled or user_id == self.payments.owner
                 or self.allowed_users and user_id not in self.allowed_users):
             return
+        self.payments.remember_client(callback["from"])
         if data == "access":
             await self.notify(user_id, self.payments.status(user_id))
             return
@@ -180,9 +230,15 @@ class Bot:
             await self.call("sendMessage", chat_id=chat_id, text="Цей бот має обмежений доступ.")
             return
 
+        text, _, args = (message.get("text") or "").strip().partition(" ")
+        command = text.split("@")[0]
+        if command in {"/stats", "/clients"}:
+            await self.show_client_report(chat_id, command, args)
+            return
+
+        self.payments.remember_client(message.get("from") or chat)
         media = message.get("video") or message.get("document")
         if not media:
-            command = (message.get("text") or "").partition(" ")[0].split("@")[0]
             if command == "/paysupport":
                 await self.notify(chat_id, "Питання щодо оплати — @P2P_Marshal. Вкажи номер рахунку, якщо він є.")
             else:

@@ -30,6 +30,46 @@ SIGNED_STATUS = (
 )
 
 
+CLIENT_STAGES = {
+    "new": "Нові · ще без пробного кружечка",
+    "trial": "Використали пробний кружечок",
+    "pending": "Створили рахунок · оплата не підтверджена",
+    "active": "Мають активний доступ",
+    "expired": "Платний доступ закінчився",
+}
+CLIENTS = """
+    WITH ids AS (
+        SELECT user_id FROM clients
+        UNION SELECT user_id FROM trial_deliveries
+        UNION SELECT user_id FROM orders
+        UNION SELECT user_id FROM access
+    ), classified AS (
+        SELECT ids.user_id, c.first_name, c.username, c.last_seen,
+               paid.plan AS paid_plan, pending.plan AS pending_plan,
+               CASE
+                   WHEN a.expires_at > :now THEN 'active'
+                   WHEN a.expires_at > 0 OR paid.reference IS NOT NULL THEN 'expired'
+                   WHEN pending.reference IS NOT NULL THEN 'pending'
+                   WHEN EXISTS (SELECT 1 FROM trial_deliveries t WHERE t.user_id = ids.user_id) THEN 'trial'
+                   ELSE 'new'
+               END AS stage
+        FROM ids
+        LEFT JOIN clients c USING (user_id)
+        LEFT JOIN access a USING (user_id)
+        LEFT JOIN orders paid ON paid.reference = (
+            SELECT reference FROM orders WHERE user_id = ids.user_id AND activated_at IS NOT NULL
+            ORDER BY activated_at DESC, created_at DESC, reference DESC LIMIT 1
+        )
+        LEFT JOIN orders pending ON pending.reference = (
+            SELECT reference FROM orders WHERE user_id = ids.user_id
+                AND activated_at IS NULL AND created_at > :invoice_since
+            ORDER BY created_at DESC, reference DESC LIMIT 1
+        )
+        WHERE ids.user_id != :owner
+    )
+"""
+
+
 class Payments:
     def __init__(self, session):
         self.session = session
@@ -52,6 +92,10 @@ class Payments:
         self.path = path
         with closing(self.connect()) as db:
             db.executescript("""
+                CREATE TABLE IF NOT EXISTS clients (
+                    user_id INTEGER PRIMARY KEY, first_name TEXT NOT NULL,
+                    username TEXT NOT NULL, last_seen INTEGER NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS access (
                     user_id INTEGER PRIMARY KEY, expires_at INTEGER NOT NULL DEFAULT 0
                 );
@@ -66,12 +110,45 @@ class Payments:
                     checked_at INTEGER NOT NULL DEFAULT 0, activated_at INTEGER,
                     notified_at INTEGER
                 );
+                CREATE INDEX IF NOT EXISTS orders_by_client ON orders(user_id, activated_at, created_at);
             """)
 
     def connect(self):
         db = sqlite3.connect(self.path)
         db.row_factory = sqlite3.Row
         return db
+
+    def remember_client(self, user):
+        if not self.enabled or user["id"] == self.owner:
+            return
+        with closing(self.connect()) as db, db:
+            db.execute(
+                """INSERT INTO clients VALUES (?,?,?,?)
+                   ON CONFLICT(user_id) DO UPDATE SET first_name=excluded.first_name,
+                   username=excluded.username, last_seen=excluded.last_seen""",
+                (user["id"], user.get("first_name") or "", user.get("username") or "", int(time.time())),
+            )
+
+    def client_report(self, stage=None, offset=0):
+        now = int(time.time())
+        params = {"now": now, "invoice_since": now - DAY, "owner": self.owner,
+                  "stage": stage, "offset": offset}
+        with closing(self.connect()) as db:
+            if stage is not None:
+                return db.execute(
+                    CLIENTS + """SELECT * FROM classified WHERE stage = :stage
+                                 ORDER BY last_seen DESC, user_id DESC LIMIT 11 OFFSET :offset""",
+                    params,
+                ).fetchall()
+
+            stages = dict(db.execute(CLIENTS + "SELECT stage, COUNT(*) FROM classified GROUP BY stage", params))
+            plans = db.execute(
+                """SELECT plan, COUNT(*) AS purchases, SUM(amount) AS revenue
+                   FROM orders WHERE activated_at IS NOT NULL AND user_id != ?
+                   GROUP BY plan""",
+                (self.owner,),
+            ).fetchall()
+            return stages, plans
 
     def state(self, user_id):
         with closing(self.connect()) as db:
