@@ -13,6 +13,7 @@ from payments import PLANS, Payments
 SIZE = 640
 MAX_SECONDS = 60
 VIDEO_FORMATS = "mov,matroska,webm,avi,mpegts,mpeg,flv,ogg,asf"
+WELCOME = "👋 Привіт! Я перетворюю відео на кружечки в Telegram. Інструкція — /help."
 HELP = (
     "🎥 Як зробити відеокружечок\n\n"
     "Надішли сюди відео до {max_mb} МБ і {max_seconds} секунд. "
@@ -186,9 +187,11 @@ class Bot:
                 await self.notify(chat_id, "Питання щодо оплати — @P2P_Marshal. Вкажи номер рахунку, якщо він є.")
             else:
                 intro = ""
-                if command not in {"/access", "/plans"}:
-                    intro = HELP.format(max_mb=self.max_bytes // 1024**2, max_seconds=MAX_SECONDS) + "\n\n"
-                await self.show_access(chat_id, intro)
+                if command == "/help":
+                    intro = HELP.format(max_mb=self.max_bytes // 1024**2, max_seconds=MAX_SECONDS)
+                elif command not in {"/access", "/plans"}:
+                    intro = WELCOME
+                await self.show_access(chat_id, intro + "\n\n" if intro else "")
             return
 
         if self.payments.blocked(chat_id):
@@ -233,13 +236,13 @@ class Bot:
             try:
                 if not configured:
                     await self.call("setMyCommands", commands=[
-                        {"command": "start", "description": "Як зробити відеокружечок"},
-                        {"command": "help", "description": "Підказка щодо відео"},
+                        {"command": "start", "description": "Почати"},
+                        {"command": "help", "description": "Як зробити відеокружечок"},
                         {"command": "access", "description": "Мій доступ"},
                         {"command": "plans", "description": "Тарифи"},
                         {"command": "paysupport", "description": "Підтримка щодо оплати"},
                     ])
-                    await self.call("setMyDescription", description=HELP)
+                    await self.call("setMyDescription", description=WELCOME)
                     logging.info("Бот готовий приймати відео до %s МБ", self.max_bytes // 1024**2)
                     configured = True
                 updates = await self.call("getUpdates", offset=offset, timeout=25,
