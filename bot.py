@@ -14,8 +14,12 @@ SIZE = 640
 MAX_SECONDS = 60
 VIDEO_FORMATS = "mov,matroska,webm,avi,mpegts,mpeg,flv,ogg,asf"
 HELP = (
-    "🎥 Надішли відео до 60 секунд, і я поверну його кружечком. "
-    "Можна надіслати відео або прикріпити його як файл."
+    "🎥 Як зробити відеокружечок\n\n"
+    "Надішли сюди відео до {max_mb} МБ і {max_seconds} секунд. "
+    "Я поверну його як кругле відеоповідомлення зі звуком.\n\n"
+    "📎 Найкраще підійде MP4. Щоб Telegram не стискав оригінал, надішли його як файл.\n"
+    "✂️ Довше відео обріж перед надсиланням. Бот кадрує по центру, "
+    "тому тримай головне в центрі кадру."
 )
 
 
@@ -181,11 +185,14 @@ class Bot:
             if command == "/paysupport":
                 await self.notify(chat_id, "Питання щодо оплати — @P2P_Marshal. Вкажи номер рахунку, якщо він є.")
             else:
-                await self.show_access(chat_id, "" if command in {"/access", "/plans"} else HELP + "\n\n")
+                intro = ""
+                if command not in {"/access", "/plans"}:
+                    intro = HELP.format(max_mb=self.max_bytes // 1024**2, max_seconds=MAX_SECONDS) + "\n\n"
+                await self.show_access(chat_id, intro)
             return
 
         if self.payments.blocked(chat_id):
-            await self.show_access(chat_id, "Пробні конвертації закінчилися. Обери тариф.\n\n")
+            await self.show_access(chat_id, "Безкоштовний кружечок уже використано. Обери тариф.\n\n")
             return
         trial = self.payments.use_trial(chat_id)
         try:

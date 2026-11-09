@@ -21,7 +21,7 @@ PLANS = {
     "week": ("RP Тиждень", 7, 391),
     "month": ("RP Місяць", 30, 414),
 }
-TRIALS = 2
+TRIALS = 1
 DAY = 86400
 API = "https://api.wayforpay.com/api"
 SIGNED_STATUS = (
