@@ -13,14 +13,15 @@ from payments import CLIENT_STAGES, PLANS, Payments
 
 SIZE = 640
 MAX_SECONDS = 60
+VIDEO_IO_TIMEOUT = 600
 VIDEO_FORMATS = "mov,matroska,webm,avi,mpegts,mpeg,flv,ogg,asf"
 WELCOME = "👋 Привіт! Я перетворюю відео на кружечки в Telegram. Інструкція — /help."
 HELP = (
     "🎥 Як зробити відеокружечок\n\n"
-    "Надішли сюди відео до {max_mb} МБ і {max_seconds} секунд. "
+    "Надішли сюди відео до {max_mb} МБ. Довгі відео автоматично ділю на частини до 60 секунд. "
     "Я поверну його як кругле відеоповідомлення зі звуком.\n\n"
     "📎 Найкраще підійде MP4. Щоб Telegram не стискав оригінал, надішли його як файл.\n"
-    "✂️ Довше відео обріж перед надсиланням. Бот кадрує по центру, "
+    "✂️ Наприклад, 3 хвилини — це 3 кружечки. Бот кадрує по центру, "
     "тому тримай головне в центрі кадру."
 )
 
@@ -43,14 +44,18 @@ async def media_command(*args, timeout):
         output, _ = await asyncio.wait_for(process.communicate(), timeout)
     finally:
         if process.returncode is None:
-            process.kill()
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
             await process.wait()
     if process.returncode:
+        logging.warning("%s failed (exit=%s)", args[0], process.returncode)
         raise VideoError("Не вдалося прочитати відео. Спробуй надіслати MP4.")
     return output
 
 
-async def convert(source, output):
+async def video_duration(source):
     metadata = json.loads(await media_command(
         "ffprobe", "-v", "error", "-protocol_whitelist", "file",
         "-format_whitelist", VIDEO_FORMATS,
@@ -62,20 +67,21 @@ async def convert(source, output):
     duration = float(metadata.get("format", {}).get("duration", "nan"))
     if not math.isfinite(duration) or duration <= 0:
         raise VideoError("Не вдалося визначити тривалість. Спробуй надіслати MP4.")
-    if duration > MAX_SECONDS:
-        raise VideoError("Відео довше 60 секунд. Обріж його в Telegram і надішли ще раз.")
+    return duration
 
+
+async def convert(source, output, start=0, duration=MAX_SECONDS):
     await media_command(
         "ffmpeg", "-nostdin", "-v", "error", "-protocol_whitelist", "file",
         "-format_whitelist", VIDEO_FORMATS,
-        "-threads", "2", "-i", str(source), "-map", "0:V:0", "-map", "0:a:0?",
+        "-threads", "2", "-ss", str(start), "-i", str(source), "-map", "0:V:0", "-map", "0:a:0?",
         "-vf", "scale=trunc(iw*sar/2)*2:ih,setsar=1,"
         f"crop='min(iw,ih)':'min(iw,ih)',scale={SIZE}:{SIZE}:flags=lanczos",
-        "-filter_threads", "2", "-fpsmax", "60", "-t", str(MAX_SECONDS),
+        "-filter_threads", "2", "-fpsmax", "60", "-t", str(duration),
         "-c:v", "libx264", "-threads", "2", "-preset", "medium",
         "-crf", "16", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
         "-ac", "2", "-map_metadata", "-1", "-movflags", "+faststart",
-        str(output), timeout=120,
+        str(output), timeout=600,
     )
     return max(1, round(duration))
 
@@ -96,7 +102,14 @@ class Bot:
         }
 
     async def call(self, method, *, form=None, **data):
-        async with self.session.post(f"{self.base}/{method}", json=data if form is None else None, data=form) as response:
+        options = {}
+        if method in {"getFile", "sendVideoNote"}:
+            options["timeout"] = aiohttp.ClientTimeout(total=VIDEO_IO_TIMEOUT, connect=10)
+        elif method == "sendChatAction":
+            options["timeout"] = aiohttp.ClientTimeout(total=5)
+        async with self.session.post(
+            f"{self.base}/{method}", json=data if form is None else None, data=form, **options
+        ) as response:
             try:
                 result = await response.json()
             except (ValueError, aiohttp.ContentTypeError):
@@ -106,23 +119,32 @@ class Bot:
                                     result.get("parameters", {}).get("retry_after", 0))
             return result["result"]
 
-    async def download(self, file_path, destination):
+    def file_limit(self, user_id):
+        if self.local_api and user_id == self.payments.owner:
+            return 500 * 1024**2
+        return self.max_bytes
+
+    async def download(self, file_path, destination, limit=None):
+        limit = self.max_bytes if limit is None else limit
         if Path(file_path).is_absolute():
             source = Path(file_path).resolve()
             if not self.local_api or not source.is_relative_to(self.cache_dir.resolve()):
                 raise VideoError("Бот не зміг відкрити файл. Спробуй ще раз.")
-            if source.stat().st_size > self.max_bytes:
+            if source.stat().st_size > limit:
                 raise VideoError("Файл завеликий.")
             return source
 
-        async with self.session.get(f"{self.file_base}/{file_path}") as response:
+        async with self.session.get(
+            f"{self.file_base}/{file_path}",
+            timeout=aiohttp.ClientTimeout(total=VIDEO_IO_TIMEOUT, connect=10),
+        ) as response:
             if response.status != 200:
                 raise TelegramError(response.status)
             size = 0
             with destination.open("wb") as stream:
                 async for chunk in response.content.iter_chunked(256 * 1024):
                     size += len(chunk)
-                    if size > self.max_bytes:
+                    if size > limit:
                         raise VideoError("Файл завеликий.")
                     stream.write(chunk)
         return destination
@@ -244,7 +266,7 @@ class Bot:
             else:
                 intro = ""
                 if command == "/help":
-                    intro = HELP.format(max_mb=self.max_bytes // 1024**2, max_seconds=MAX_SECONDS)
+                    intro = HELP.format(max_mb=self.file_limit(chat_id) // 1024**2, max_seconds=MAX_SECONDS)
                 elif command not in {"/access", "/plans"}:
                     intro = WELCOME
                 await self.show_access(chat_id, intro + "\n\n" if intro else "")
@@ -254,36 +276,64 @@ class Bot:
             await self.show_access(chat_id, "Безкоштовний кружечок уже використано. Обери тариф.\n\n")
             return
         trial = self.payments.use_trial(chat_id)
+        stage = "validation"
+        delivered = 0
+        limit = self.file_limit(chat_id)
         try:
-            if (media.get("file_size") or 0) > self.max_bytes:
-                raise VideoError(f"Файл завеликий. Ліміт цього бота — {self.max_bytes // 1024**2} МБ.")
-            if (media.get("duration") or 0) > MAX_SECONDS:
-                raise VideoError("Відео довше 60 секунд. Обріж його в Telegram і надішли ще раз.")
-            await self.call("sendChatAction", chat_id=chat_id, action="upload_video_note")
+            if (media.get("file_size") or 0) > limit:
+                raise VideoError(f"Файл завеликий. Твій ліміт — {limit // 1024**2} МБ.")
+            stage = "getFile"
+            try:
+                await self.call("sendChatAction", chat_id=chat_id, action="upload_video_note")
+            except (TelegramError, aiohttp.ClientError, TimeoutError) as error:
+                logging.warning("Video progress indicator failed (%s)", type(error).__name__)
             file = await self.call("getFile", file_id=media["file_id"])
             with tempfile.TemporaryDirectory(prefix="rp-video-") as folder:
-                output = Path(folder) / "circle.mp4"
-                source = await self.download(file["file_path"], Path(folder) / "input")
-                duration = await convert(source, output)
-                with output.open("rb") as video:
-                    form = aiohttp.FormData()
-                    form.add_field("chat_id", str(chat_id))
-                    form.add_field("length", str(SIZE))
-                    form.add_field("duration", str(duration))
-                    form.add_field("reply_parameters", json.dumps({
-                        "message_id": message["message_id"],
-                        "allow_sending_without_reply": True,
-                    }))
-                    form.add_field("video_note", video, filename=output.name, content_type="video/mp4")
-                    await self.call("sendVideoNote", form=form)
-                if trial:
-                    self.payments.record_trial(chat_id, message["message_id"])
+                stage = "download"
+                source = await self.download(file["file_path"], Path(folder) / "input", limit)
+                stage = "probe"
+                total_duration = await video_duration(source)
+                parts = math.ceil(total_duration / MAX_SECONDS)
+                if trial and parts > 1:
+                    raise VideoError("Безкоштовно доступний один кружечок. Надішли відео до 60 секунд або обери тариф /plans.")
+                await self.notify(chat_id, f"🎬 Обробляю відео. Частин: {parts}. Зачекай, будь ласка.")
+                for index in range(parts):
+                    output = Path(folder) / "circle.mp4"
+                    stage = "convert"
+                    seconds = min(MAX_SECONDS, total_duration - index * MAX_SECONDS)
+                    duration = await convert(source, output, index * MAX_SECONDS, seconds)
+                    stage = "sendVideoNote"
+                    with output.open("rb") as video:
+                        form = aiohttp.FormData()
+                        form.add_field("chat_id", str(chat_id))
+                        form.add_field("length", str(SIZE))
+                        form.add_field("duration", str(min(MAX_SECONDS, duration)))
+                        form.add_field("reply_parameters", json.dumps({
+                            "message_id": message["message_id"],
+                            "allow_sending_without_reply": True,
+                        }))
+                        form.add_field("video_note", video, filename=output.name, content_type="video/mp4")
+                        await self.call("sendVideoNote", form=form)
+                    delivered += 1
+                    if trial:
+                        self.payments.record_trial(chat_id, message["message_id"])
+                    output.unlink()
+                logging.info("Video completed parts=%s", delivered)
         except VideoError as error:
-            await self.call("sendMessage", chat_id=chat_id, text=str(error))
+            await self.notify(chat_id, f"Надіслано частин: {delivered}. " + str(error))
         except (TelegramError, aiohttp.ClientError, TimeoutError, OSError, KeyError, ValueError) as error:
-            logging.warning("Conversion request failed (%s)", type(error).__name__)
-            await self.call("sendMessage", chat_id=chat_id,
-                            text="Не вдалося зробити кружечок. Спробуй надіслати відео ще раз.")
+            logging.warning(
+                "Video failed: stage=%s type=%s code=%s size=%s duration=%s",
+                stage, type(error).__name__, getattr(error, "code", getattr(error, "errno", None)),
+                media.get("file_size"), media.get("duration"),
+            )
+            hints = {
+                "getFile": "Не вдалося отримати відео з Telegram. Спробуй надіслати його як файл.",
+                "download": "Не вдалося завантажити відео. Спробуй надіслати його як файл.",
+                "convert": "Не вдалося обробити відео. Спробуй коротший ролик у форматі MP4.",
+                "sendVideoNote": "Кружечок створено, але Telegram не підтвердив надсилання. Перевір чат і за потреби повтори.",
+            }
+            await self.notify(chat_id, f"Надіслано частин: {delivered}. " + hints.get(stage, "Не вдалося обробити відео. Спробуй MP4.") + f" Код етапу: {stage}.")
 
     async def run(self):
         offset = 0
@@ -299,7 +349,7 @@ class Bot:
                         {"command": "paysupport", "description": "Підтримка щодо оплати"},
                     ])
                     await self.call("setMyDescription", description=WELCOME)
-                    logging.info("Бот готовий приймати відео до %s МБ", self.max_bytes // 1024**2)
+                    logging.info("Версія 1_4. Ліміт %s МБ, OWNER %s МБ. Автонарізка увімкнена", self.max_bytes // 1024**2, self.file_limit(self.payments.owner) // 1024**2)
                     configured = True
                 updates = await self.call("getUpdates", offset=offset, timeout=25,
                                           allowed_updates=["message", "callback_query"])
