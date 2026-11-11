@@ -4,6 +4,7 @@ import logging
 import math
 import os
 import re
+import random
 import tempfile
 from pathlib import Path
 
@@ -191,6 +192,39 @@ class Bot:
     async def notify(self, chat_id, text):
         await self.call("sendMessage", chat_id=chat_id, text=text)
 
+    async def send_greeting(self, chat_id):
+        names = os.getenv(
+            "GREETING_STICKER_SET",
+            "UtyaDuck,HotCherry,MrCat,Buddy_Bear,FroggoInLove",
+        ).split(",")
+        names = list(dict.fromkeys(name.strip() for name in names if name.strip()))
+        random.shuffle(names)
+        cache = getattr(self, "greeting_packs", {})
+        self.greeting_packs = cache
+        try:
+            async with asyncio.timeout(15):
+                for name in names:
+                    try:
+                        if name not in cache:
+                            pack = await self.call("getStickerSet", name=name)
+                            animated = [
+                                sticker for sticker in pack.get("stickers", [])
+                                if sticker.get("type") == "regular"
+                                and (sticker.get("is_animated") or sticker.get("is_video"))
+                            ]
+                            greetings = [
+                                sticker for sticker in animated
+                                if any(emoji in sticker.get("emoji", "") for emoji in ("👋", "🤗", "🙌", "🤝", "❤️"))
+                            ]
+                            cache[name] = [sticker["file_id"] for sticker in (greetings or animated)]
+                        if cache[name]:
+                            await self.call("sendSticker", chat_id=chat_id, sticker=random.choice(cache[name]))
+                            return
+                    except TelegramError:
+                        logging.warning("Greeting pack unavailable")
+        except (aiohttp.ClientError, TimeoutError, KeyError, TypeError):
+            logging.warning("Greeting sticker unavailable")
+
     async def show_access(self, chat_id, text=""):
         buttons = [[{"text": "💎 Переглянути тарифи", "callback_data": "plans"}]]
         megabytes, seconds = self.payments.limits(chat_id)
@@ -322,6 +356,8 @@ class Bot:
             else:
                 intro = "" if command == "/access" else WELCOME + "\n\n"
                 await self.show_access(chat_id, intro)
+                if command == "/start":
+                    await self.send_greeting(chat_id)
             return
 
         if self.payments.blocked(chat_id):
@@ -409,7 +445,7 @@ class Bot:
                         {"command": "paysupport", "description": "Підтримка щодо оплати"},
                     ])
                     await self.call("setMyDescription", description=WELCOME)
-                    logging.info("Версія 1_8. Ліміт %s МБ, OWNER %s МБ. Автонарізка увімкнена", self.max_bytes // 1024**2, self.file_limit(self.payments.owner) // 1024**2)
+                    logging.info("Версія 1_10. Ліміт %s МБ, OWNER %s МБ. Автонарізка увімкнена", self.max_bytes // 1024**2, self.file_limit(self.payments.owner) // 1024**2)
                     configured = True
                 updates = await self.call("getUpdates", offset=offset, timeout=25,
                                           allowed_updates=["message", "callback_query"])
