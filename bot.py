@@ -13,6 +13,7 @@ from payments import CLIENT_STAGES, PLANS, Payments
 
 SIZE = 640
 MAX_SECONDS = 60
+MAX_NOTE_BYTES = 12 * 1024**2
 VIDEO_IO_TIMEOUT = 600
 VIDEO_FORMATS = "mov,matroska,webm,avi,mpegts,mpeg,flv,ogg,asf"
 WELCOME = "👋 Привіт! Я перетворюю відео на кружечки в Telegram. Інструкція — /help."
@@ -80,7 +81,7 @@ async def video_duration(source):
 
 
 async def convert(source, output, start=0, duration=MAX_SECONDS):
-    await media_command(
+    args = [
         "ffmpeg", "-nostdin", "-v", "error", "-protocol_whitelist", "file",
         "-format_whitelist", VIDEO_FORMATS,
         "-threads", "2", "-ss", str(start), "-i", str(source), "-map", "0:V:0", "-map", "0:a:0?",
@@ -90,8 +91,24 @@ async def convert(source, output, start=0, duration=MAX_SECONDS):
         "-c:v", "libx264", "-threads", "2", "-preset", "medium",
         "-crf", "16", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
         "-ac", "2", "-map_metadata", "-1", "-movflags", "+faststart",
-        str(output), timeout=600,
-    )
+    ]
+    await media_command(*args, str(output), timeout=600)
+    if output.stat().st_size > MAX_NOTE_BYTES:
+        # Reserve 10% for container overhead and bitrate variation.
+        video_bitrate = max(64000, int(MAX_NOTE_BYTES * 8 * 0.90 / duration) - 192000)
+        rate_index = args.index("-crf")
+        args[rate_index:rate_index + 2] = ["-b:v", str(video_bitrate)]
+        pass_log = str(output.with_suffix(".pass"))
+        await media_command(
+            *args, "-pass", "1", "-passlogfile", pass_log,
+            "-an", "-f", "null", "-y", os.devnull, timeout=600,
+        )
+        await media_command(
+            *args, "-pass", "2", "-passlogfile", pass_log,
+            "-y", str(output), timeout=600,
+        )
+        if output.stat().st_size > MAX_NOTE_BYTES:
+            raise VideoError("Кружечок перевищив ліміт Telegram. Спробуй коротший фрагмент.")
     return max(1, round(duration))
 
 
@@ -369,7 +386,7 @@ class Bot:
                         {"command": "paysupport", "description": "Підтримка щодо оплати"},
                     ])
                     await self.call("setMyDescription", description=WELCOME)
-                    logging.info("Версія 1_6. Ліміт %s МБ, OWNER %s МБ. Автонарізка увімкнена", self.max_bytes // 1024**2, self.file_limit(self.payments.owner) // 1024**2)
+                    logging.info("Версія 1_7. Ліміт %s МБ, OWNER %s МБ. Автонарізка увімкнена", self.max_bytes // 1024**2, self.file_limit(self.payments.owner) // 1024**2)
                     configured = True
                 updates = await self.call("getUpdates", offset=offset, timeout=25,
                                           allowed_updates=["message", "callback_query"])
