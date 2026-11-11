@@ -18,11 +18,16 @@ VIDEO_FORMATS = "mov,matroska,webm,avi,mpegts,mpeg,flv,ogg,asf"
 WELCOME = "👋 Привіт! Я перетворюю відео на кружечки в Telegram. Інструкція — /help."
 HELP = (
     "🎥 Як зробити відеокружечок\n\n"
-    "Надішли сюди відео до {max_mb} МБ. Довгі відео автоматично ділю на частини до 60 секунд. "
-    "Я поверну його як кругле відеоповідомлення зі звуком.\n\n"
-    "📎 Найкраще підійде MP4. Щоб Telegram не стискав оригінал, надішли його як файл.\n"
-    "✂️ Наприклад, 3 хвилини — це 3 кружечки. Бот кадрує по центру, "
-    "тому тримай головне в центрі кадру."
+    "Надішли відео — отримаєш кругле відеоповідомлення зі звуком.\n\n"
+    "🎁 Безкоштовно — 1 кружечок, до 200 МБ і 60 секунд.\n"
+    "• RP День · 46 грн — доступ на 1 день, до 200 МБ і 60 секунд.\n"
+    "• RP П’ять днів · 230 грн — доступ на 5 днів, до 250 МБ і 60 секунд.\n"
+    "• RP Тиждень · 391 грн — доступ на 7 днів, до 300 МБ і 120 секунд. "
+    "Відео довше 60 секунд автоматично ділю на 2 кружечки.\n"
+    "• RP Місяць · 414 грн — доступ на 30 днів, до 400 МБ і 180 секунд. "
+    "Автоматично ділю на частини до 60 секунд, максимум 3 кружечки.\n\n"
+    "📎 Для кращої якості надсилай оригінал як файл. Найкраще підійде MP4. "
+    "Тримай головне в центрі — бот кадрує відео по центру."
 )
 
 
@@ -31,9 +36,13 @@ class VideoError(Exception):
 
 
 class TelegramError(Exception):
-    def __init__(self, code, retry_after=0):
+    def __init__(self, code, retry_after=0, description=""):
         self.code = code
         self.retry_after = retry_after
+        description = re.sub(r"https?://\S+", "[url]", str(description))
+        description = re.sub(r"\d{6,}:[A-Za-z0-9_-]+", "[token]", description)
+        self.description = " ".join(description.split())[:400]
+        super().__init__(self.description or str(code))
 
 
 async def media_command(*args, timeout):
@@ -116,13 +125,13 @@ class Bot:
                 raise TelegramError(response.status) from None
             if not result.get("ok"):
                 raise TelegramError(result.get("error_code", response.status),
-                                    result.get("parameters", {}).get("retry_after", 0))
+                                    result.get("parameters", {}).get("retry_after", 0),
+                                    result.get("description", ""))
             return result["result"]
 
     def file_limit(self, user_id):
-        if self.local_api and user_id == self.payments.owner:
-            return 500 * 1024**2
-        return self.max_bytes
+        megabytes, _ = self.payments.limits(user_id)
+        return min(megabytes * 1024**2, 500 * 1024**2 if self.local_api else self.max_bytes)
 
     async def download(self, file_path, destination, limit=None):
         limit = self.max_bytes if limit is None else limit
@@ -160,8 +169,11 @@ class Bot:
                 for plan, (title, _, amount) in PLANS.items()
             ]
             buttons.append([{"text": "Мій доступ", "callback_data": "access"}])
+        megabytes, seconds = self.payments.limits(chat_id)
+        duration_text = f"{seconds} с" if seconds is not None else "автонарізка довгих відео"
+        current_limits = f"\n📎 Твій ліміт — {self.file_limit(chat_id) // 1024**2} МБ · {duration_text}."
         await self.call(
-            "sendMessage", chat_id=chat_id, text=text + self.payments.status(chat_id),
+            "sendMessage", chat_id=chat_id, text=text + self.payments.status(chat_id) + current_limits,
             reply_markup={"inline_keyboard": buttons},
         )
 
@@ -266,7 +278,7 @@ class Bot:
             else:
                 intro = ""
                 if command == "/help":
-                    intro = HELP.format(max_mb=self.file_limit(chat_id) // 1024**2, max_seconds=MAX_SECONDS)
+                    intro = HELP
                 elif command not in {"/access", "/plans"}:
                     intro = WELCOME
                 await self.show_access(chat_id, intro + "\n\n" if intro else "")
@@ -279,9 +291,12 @@ class Bot:
         stage = "validation"
         delivered = 0
         limit = self.file_limit(chat_id)
+        _, max_duration = self.payments.limits(chat_id)
         try:
             if (media.get("file_size") or 0) > limit:
                 raise VideoError(f"Файл завеликий. Твій ліміт — {limit // 1024**2} МБ.")
+            if max_duration is not None and (media.get("duration") or 0) > max_duration:
+                raise VideoError(f"Ліміт твого доступу — {max_duration} секунд на відео. Тарифи — /plans.")
             stage = "getFile"
             try:
                 await self.call("sendChatAction", chat_id=chat_id, action="upload_video_note")
@@ -293,6 +308,8 @@ class Bot:
                 source = await self.download(file["file_path"], Path(folder) / "input", limit)
                 stage = "probe"
                 total_duration = await video_duration(source)
+                if max_duration is not None and total_duration > max_duration:
+                    raise VideoError(f"Ліміт твого доступу — {max_duration} секунд на відео. Тарифи — /plans.")
                 parts = math.ceil(total_duration / MAX_SECONDS)
                 if trial and parts > 1:
                     raise VideoError("Безкоштовно доступний один кружечок. Надішли відео до 60 секунд або обери тариф /plans.")
@@ -323,9 +340,9 @@ class Bot:
             await self.notify(chat_id, f"Надіслано частин: {delivered}. " + str(error))
         except (TelegramError, aiohttp.ClientError, TimeoutError, OSError, KeyError, ValueError) as error:
             logging.warning(
-                "Video failed: stage=%s type=%s code=%s size=%s duration=%s",
+                "Video failed: stage=%s type=%s code=%s size=%s duration=%s reason=%s",
                 stage, type(error).__name__, getattr(error, "code", getattr(error, "errno", None)),
-                media.get("file_size"), media.get("duration"),
+                media.get("file_size"), media.get("duration"), getattr(error, "description", ""),
             )
             hints = {
                 "getFile": "Не вдалося отримати відео з Telegram. Спробуй надіслати його як файл.",
@@ -333,7 +350,10 @@ class Bot:
                 "convert": "Не вдалося обробити відео. Спробуй коротший ролик у форматі MP4.",
                 "sendVideoNote": "Кружечок створено, але Telegram не підтвердив надсилання. Перевір чат і за потреби повтори.",
             }
-            await self.notify(chat_id, f"Надіслано частин: {delivered}. " + hints.get(stage, "Не вдалося обробити відео. Спробуй MP4.") + f" Код етапу: {stage}.")
+            detail = ""
+            if chat_id == self.payments.owner and isinstance(error, TelegramError):
+                detail = f"\nTelegram {error.code} — {error.description or 'опис відсутній'}"
+            await self.notify(chat_id, f"Надіслано частин: {delivered}. " + hints.get(stage, "Не вдалося обробити відео. Спробуй MP4.") + f" Код етапу: {stage}." + detail)
 
     async def run(self):
         offset = 0
@@ -349,7 +369,7 @@ class Bot:
                         {"command": "paysupport", "description": "Підтримка щодо оплати"},
                     ])
                     await self.call("setMyDescription", description=WELCOME)
-                    logging.info("Версія 1_4. Ліміт %s МБ, OWNER %s МБ. Автонарізка увімкнена", self.max_bytes // 1024**2, self.file_limit(self.payments.owner) // 1024**2)
+                    logging.info("Версія 1_6. Ліміт %s МБ, OWNER %s МБ. Автонарізка увімкнена", self.max_bytes // 1024**2, self.file_limit(self.payments.owner) // 1024**2)
                     configured = True
                 updates = await self.call("getUpdates", offset=offset, timeout=25,
                                           allowed_updates=["message", "callback_query"])

@@ -21,6 +21,12 @@ PLANS = {
     "week": ("RP Тиждень", 7, 391),
     "month": ("RP Місяць", 30, 414),
 }
+PLAN_LIMITS = {
+    "day": (200, 60),
+    "five": (250, 60),
+    "week": (300, 120),
+    "month": (400, 180),
+}
 TRIALS = 1
 DAY = 86400
 API = "https://api.wayforpay.com/api"
@@ -159,6 +165,20 @@ class Payments:
                 "SELECT COUNT(*) FROM trial_deliveries WHERE user_id=?", (user_id,)
             ).fetchone()[0]
         return expiry[0] if expiry else 0, max(0, TRIALS - used)
+
+    def limits(self, user_id):
+        if user_id == self.owner:
+            return 500, None
+        if not self.enabled:
+            return PLAN_LIMITS["day"]
+        with closing(self.connect()) as db:
+            row = db.execute(
+                """SELECT o.plan FROM orders o JOIN access a USING(user_id)
+                   WHERE o.user_id=? AND a.expires_at>? AND o.activated_at IS NOT NULL
+                   ORDER BY o.activated_at DESC, o.created_at DESC, o.reference DESC LIMIT 1""",
+                (user_id, int(time.time())),
+            ).fetchone()
+        return PLAN_LIMITS.get(row["plan"], PLAN_LIMITS["day"]) if row else PLAN_LIMITS["day"]
 
     def status(self, user_id):
         if user_id == self.owner:
