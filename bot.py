@@ -17,18 +17,31 @@ MAX_NOTE_BYTES = 12 * 1024**2
 VIDEO_IO_TIMEOUT = 600
 VIDEO_FORMATS = "mov,matroska,webm,avi,mpegts,mpeg,flv,ogg,asf"
 WELCOME = "👋 Привіт! Я перетворюю відео на кружечки в Telegram. Інструкція — /help."
+TARIFFS = (
+    "🎁 Спробуй безкоштовно\n"
+    "1 кружечок · до 200 МБ · до 60 секунд\n\n"
+    "☀️ RP День — 46 грн\n"
+    "Доступ на 1 день\n"
+    "До 200 МБ · до 60 секунд · 1 кружечок з відео\n\n"
+    "✨ RP П’ять днів — 230 грн\n"
+    "Доступ на 5 днів\n"
+    "До 250 МБ · до 60 секунд · 1 кружечок з відео\n\n"
+    "🚀 RP Тиждень — 391 грн\n"
+    "Доступ на 7 днів\n"
+    "До 300 МБ · до 2 хвилин\n"
+    "Автонарізка на 2 кружечки, якщо відео довше 60 секунд\n\n"
+    "👑 RP Місяць — 414 грн\n"
+    "Доступ на 30 днів\n"
+    "До 400 МБ · до 3 хвилин\n"
+    "Автонарізка на частини до 60 секунд — максимум 3 кружечки"
+)
 HELP = (
     "🎥 Як зробити відеокружечок\n\n"
-    "Надішли відео — отримаєш кругле відеоповідомлення зі звуком.\n\n"
-    "🎁 Безкоштовно — 1 кружечок, до 200 МБ і 60 секунд.\n"
-    "• RP День · 46 грн — доступ на 1 день, до 200 МБ і 60 секунд.\n"
-    "• RP П’ять днів · 230 грн — доступ на 5 днів, до 250 МБ і 60 секунд.\n"
-    "• RP Тиждень · 391 грн — доступ на 7 днів, до 300 МБ і 120 секунд. "
-    "Відео довше 60 секунд автоматично ділю на 2 кружечки.\n"
-    "• RP Місяць · 414 грн — доступ на 30 днів, до 400 МБ і 180 секунд. "
-    "Автоматично ділю на частини до 60 секунд, максимум 3 кружечки.\n\n"
-    "📎 Для кращої якості надсилай оригінал як файл. Найкраще підійде MP4. "
-    "Тримай головне в центрі — бот кадрує відео по центру."
+    "Надішли сюди відео — отримаєш кругле відеоповідомлення зі звуком.\n\n"
+    "📎 Для кращої якості надсилай оригінал як файл. Найкраще підійде MP4.\n\n"
+    "🎯 Тримай головне в центрі кадру — бот обрізає відео по центру.\n\n"
+    "✂️ Довгі відео ділю на частини до 60 секунд відповідно до тарифу.\n\n"
+    + TARIFFS
 )
 
 
@@ -179,13 +192,7 @@ class Bot:
         await self.call("sendMessage", chat_id=chat_id, text=text)
 
     async def show_access(self, chat_id, text=""):
-        buttons = []
-        if self.payments.enabled and chat_id != self.payments.owner:
-            buttons = [
-                [{"text": f"{title} · {amount} грн", "callback_data": f"buy:{plan}"}]
-                for plan, (title, _, amount) in PLANS.items()
-            ]
-            buttons.append([{"text": "Мій доступ", "callback_data": "access"}])
+        buttons = [[{"text": "💎 Переглянути тарифи", "callback_data": "plans"}]]
         megabytes, seconds = self.payments.limits(chat_id)
         duration_text = f"{seconds} с" if seconds is not None else "автонарізка довгих відео"
         current_limits = f"\n📎 Твій ліміт — {self.file_limit(chat_id) // 1024**2} МБ · {duration_text}."
@@ -193,6 +200,18 @@ class Bot:
             "sendMessage", chat_id=chat_id, text=text + self.payments.status(chat_id) + current_limits,
             reply_markup={"inline_keyboard": buttons},
         )
+
+    async def show_plans(self, chat_id):
+        buttons = []
+        if self.payments.enabled and chat_id != self.payments.owner:
+            buttons = [
+                [{"text": f"{title} · {amount} грн", "callback_data": f"buy:{plan}"}]
+                for plan, (title, _, amount) in PLANS.items()
+            ]
+        buttons.append([{"text": "📋 Мій доступ", "callback_data": "access"}])
+        await self.call("sendMessage", chat_id=chat_id,
+                        text="💎 Обери свій тариф\n\n" + TARIFFS,
+                        reply_markup={"inline_keyboard": buttons})
 
     async def show_client_report(self, chat_id, command, args):
         if chat_id != self.payments.owner:
@@ -249,12 +268,16 @@ class Bot:
         data = callback.get("data", "")
         if chat.get("type") != "private" or chat.get("id") != user_id:
             return
-        if (not self.payments.enabled or user_id == self.payments.owner
-                or self.allowed_users and user_id not in self.allowed_users):
+        if self.allowed_users and user_id not in self.allowed_users and user_id != self.payments.owner:
             return
         self.payments.remember_client(callback["from"])
+        if data == "plans":
+            await self.show_plans(user_id)
+            return
         if data == "access":
-            await self.notify(user_id, self.payments.status(user_id))
+            await self.show_access(user_id)
+            return
+        if not self.payments.enabled or user_id == self.payments.owner:
             return
         if not data.startswith("buy:") or data[4:] not in PLANS:
             return
@@ -292,13 +315,13 @@ class Bot:
         if not media:
             if command == "/paysupport":
                 await self.notify(chat_id, "Питання щодо оплати — @P2P_Marshal. Вкажи номер рахунку, якщо він є.")
+            elif command == "/plans":
+                await self.show_plans(chat_id)
+            elif command == "/help":
+                await self.notify(chat_id, HELP)
             else:
-                intro = ""
-                if command == "/help":
-                    intro = HELP
-                elif command not in {"/access", "/plans"}:
-                    intro = WELCOME
-                await self.show_access(chat_id, intro + "\n\n" if intro else "")
+                intro = "" if command == "/access" else WELCOME + "\n\n"
+                await self.show_access(chat_id, intro)
             return
 
         if self.payments.blocked(chat_id):
@@ -386,7 +409,7 @@ class Bot:
                         {"command": "paysupport", "description": "Підтримка щодо оплати"},
                     ])
                     await self.call("setMyDescription", description=WELCOME)
-                    logging.info("Версія 1_7. Ліміт %s МБ, OWNER %s МБ. Автонарізка увімкнена", self.max_bytes // 1024**2, self.file_limit(self.payments.owner) // 1024**2)
+                    logging.info("Версія 1_8. Ліміт %s МБ, OWNER %s МБ. Автонарізка увімкнена", self.max_bytes // 1024**2, self.file_limit(self.payments.owner) // 1024**2)
                     configured = True
                 updates = await self.call("getUpdates", offset=offset, timeout=25,
                                           allowed_updates=["message", "callback_query"])
